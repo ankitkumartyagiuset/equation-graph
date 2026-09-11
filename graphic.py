@@ -2,7 +2,15 @@ import streamlit as st
 import numpy as np
 import sympy as sp
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib import cm
 import re
+from sympy.parsing.sympy_parser import (
+    parse_expr as sympy_parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+    convert_xor,
+)
 
 st.set_page_config(
     page_title="Universal Graph Question Solver",
@@ -28,19 +36,96 @@ x, y, t, u, v = sp.symbols("x y t u v")
 MATH.update({"x": x, "y": y, "t": t, "u": u, "v": v})
 
 
+TRANSFORMATIONS = standard_transformations + (
+    convert_xor,
+    implicit_multiplication_application,
+)
+
+SUPERSCRIPT_MAP = str.maketrans({
+    "⁰": "0", "¹": "1", "²": "2", "³": "3",
+    "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7",
+    "⁸": "8", "⁹": "9",
+})
+
+FUNCTION_NAMES = (
+    "sin", "cos", "tan", "asin", "acos", "atan",
+    "sinh", "cosh", "tanh", "sqrt", "log", "ln", "exp",
+    "abs", "sign", "floor", "ceil"
+)
+
+
 def clean_math(s):
-    """Make common calculator/exam notation SymPy-friendly."""
-    s = s.strip()
-    s = s.replace("−", "-").replace("π", "pi")
-    s = s.replace("×", "*").replace("·", "*")
+    """Normalize common handwritten/Unicode mathematical notation."""
+    s = str(s).strip()
+
+    # Unicode operators / symbols
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("π", "pi").replace("∞", "oo")
+    s = s.replace("×", "*").replace("·", "*").replace("÷", "/")
+    s = s.replace("＝", "=")
+
+    # Superscript digits: x², sin³(t), etc.
+    s = s.translate(SUPERSCRIPT_MAP)
+
+    # Common superscript formatting after a function:
+    # sin³(t) -> sin(t)**3
+    for fn in FUNCTION_NAMES:
+        s = re.sub(
+            rf"\b{fn}\s*\^\s*(\d+)\s*\(",
+            rf"{fn}(",
+            s,
+            flags=re.I,
+        )
+        # The superscript was already translated, so handle sin3(t)
+        # only when it is immediately followed by '('.
+        s = re.sub(
+            rf"\b({fn})\s*(\d+)\s*\(",
+            lambda m: f"{m.group(1)}({''}",
+            s,
+            flags=re.I,
+        )
+
+    # The previous substitution intentionally needs the exponent restored.
+    # Do the reliable pattern directly from original-ish notation by handling
+    # function + digits before an opening parenthesis.
+    for fn in FUNCTION_NAMES:
+        # e.g. sin3(t) -> sin(t)**3
+        s = re.sub(
+            rf"\b({fn})\s*(\d+)\s*\(([^()]*)\)",
+            lambda m: f"{m.group(1)}({m.group(3)})**{m.group(2)}",
+            s,
+            flags=re.I,
+        )
+
+    # Explicit caret notation.
     s = s.replace("^", "**")
-    s = re.sub(r"\bln\s*\(", "log(", s)
+
+    # log base notation: log₂(x) / log2(x) is not universally expected,
+    # so leave ordinary log(...) untouched.
     return s
 
 
 def parse_expr(text):
-    return sp.sympify(clean_math(text), locals=MATH)
+    """Restricted SymPy parser with implicit multiplication enabled."""
+    normalized = clean_math(text)
 
+    # Make Unicode superscript function powers robustly:
+    # sin³(t) may have become sin3(t) above, so detect the original pattern
+    # separately if needed.
+    normalized = re.sub(
+        r"\b(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|sqrt|log|ln|exp|abs|sign|floor|ceil)"
+        r"\s*(\d+)\s*\(([^()]*)\)",
+        lambda m: f"{m.group(1)}({m.group(3)})**{m.group(2)}",
+        normalized,
+        flags=re.I,
+    )
+
+    return sympy_parse_expr(
+        normalized,
+        local_dict=MATH,
+        transformations=TRANSFORMATIONS,
+        evaluate=True,
+    )
 
 def equation_to_expression(text, variable=None):
     """
@@ -107,7 +192,10 @@ def extract_equations(question):
 
         # Keep lines containing likely graph syntax.
         if re.search(r"(=|\by\s*=|\bx\s*=|\br\s*=|\bz\s*=)", s, re.I):
-            found.append(s)
+            # Split common inline pairs such as:
+            # x(t)=cos(t), y(t)=sin(t)
+            parts = re.split(r"\s*,\s*(?=(?:x|y|z|r)\s*(?:\([^)]*\))?\s*=)", s, flags=re.I)
+            found.extend(parts if len(parts) > 1 else [s])
 
     # Also handle a single sentence containing an equation.
     if not found:
@@ -135,6 +223,11 @@ def detect_graph_type(question, equations):
 
     if "parametric" in q or any("(t)" in e.lower() for e in equations):
         return "2D Parametric"
+
+    if any(k in q for k in ["animate", "animation", "rotating", "moving"]):
+        if re.search(r"\bx\s*\(\s*u\s*,\s*v\s*\)", " ".join(equations), re.I):
+            return "3D Animated Parametric"
+        return "3D Animated Surface"
 
     if "surface" in q or re.search(r"\bz\s*=", " ".join(equations), re.I):
         return "3D Surface"
@@ -177,6 +270,128 @@ def plot_special(name, ax, resolution):
 
 
 # ---------------------------------------------------------
+# 3D Animation helper
+# ---------------------------------------------------------
+def animate_3d_surface(expr, xmin, xmax, ymin, ymax, resolution=180):
+    """Create an animated rotating 3D surface and return the HTML."""
+    from matplotlib.animation import FuncAnimation
+    from matplotlib import cm
+    from matplotlib import pyplot as plt
+
+    n = min(int(resolution), 220)
+    X = np.linspace(xmin, xmax, n)
+    Y = np.linspace(ymin, ymax, n)
+    XX, YY = np.meshgrid(X, Y)
+
+    fn = sp.lambdify((x, y), expr, "numpy")
+    ZZ = np.asarray(fn(XX, YY), dtype=float)
+    ZZ[~np.isfinite(ZZ)] = np.nan
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    finite = ZZ[np.isfinite(ZZ)]
+    if finite.size:
+        zmin, zmax = np.nanpercentile(finite, [2, 98])
+        if zmin == zmax:
+            zmin, zmax = np.nanmin(finite), np.nanmax(finite)
+        ax.set_zlim(zmin, zmax)
+
+    surf = [None]
+
+    def update(frame):
+        ax.clear()
+        surf[0] = ax.plot_surface(
+            XX, YY, ZZ,
+            cmap=cm.viridis,
+            linewidth=0,
+            antialiased=True
+        )
+        ax.view_init(elev=28, azim=frame)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.set_title("🌌 Animated 3D Surface")
+        return (surf[0],)
+
+    animation = FuncAnimation(
+        fig,
+        update,
+        frames=np.arange(0, 360, 4),
+        interval=60,
+        blit=False
+    )
+
+    from matplotlib.animation import PillowWriter
+    import tempfile
+    import base64
+
+    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+        gif_path = tmp.name
+
+    animation.save(gif_path, writer=PillowWriter(fps=15))
+    plt.close(fig)
+
+    data = Path(gif_path).read_bytes()
+    return base64.b64encode(data).decode("utf-8")
+
+
+def animate_3d_parametric(ex, ey, ez, resolution=260):
+    """Create a rotating 3D parametric surface/shape."""
+    from matplotlib.animation import FuncAnimation
+    from matplotlib import cm
+    import tempfile
+    import base64
+
+    n = min(int(resolution), 260)
+    U = np.linspace(0, np.pi, n)
+    V = np.linspace(0, 2 * np.pi, n)
+    UU, VV = np.meshgrid(U, V)
+
+    fx = sp.lambdify((u, v), ex, "numpy")
+    fy = sp.lambdify((u, v), ey, "numpy")
+    fz = sp.lambdify((u, v), ez, "numpy")
+
+    XX = np.asarray(fx(UU, VV), dtype=float)
+    YY = np.asarray(fy(UU, VV), dtype=float)
+    ZZ = np.asarray(fz(UU, VV), dtype=float)
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    def update(frame):
+        ax.clear()
+        ax.plot_surface(
+            XX, YY, ZZ,
+            cmap=cm.plasma,
+            linewidth=0,
+            antialiased=True
+        )
+        ax.view_init(elev=25 + 8*np.sin(np.radians(frame)), azim=frame)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.set_title("✨ Animated 3D Parametric Surface")
+
+    animation = FuncAnimation(
+        fig,
+        update,
+        frames=np.arange(0, 360, 5),
+        interval=70,
+        blit=False
+    )
+
+    from matplotlib.animation import PillowWriter
+    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+        gif_path = tmp.name
+
+    animation.save(gif_path, writer=PillowWriter(fps=14))
+    plt.close(fig)
+
+    return base64.b64encode(Path(gif_path).read_bytes()).decode("utf-8")
+
+
+# ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
 st.title("📈 Universal Graph Question Solver")
@@ -212,6 +427,8 @@ with st.sidebar:
             "2D Parametric",
             "Polar",
             "3D Surface",
+            "3D Animated Surface",
+            "3D Animated Parametric",
             "Butterfly",
             "Heart"
         ]
@@ -242,7 +459,9 @@ with st.sidebar:
             "Heart",
             "Parametric circle",
             "Polar cardioid",
-            "3D paraboloid"
+            "3D paraboloid",
+            "Animated 3D paraboloid",
+            "Animated 3D sphere"
         ]
     )
 
@@ -255,7 +474,14 @@ if example != "None" and st.button("Use Example"):
         "Heart": "Plot the heart curve",
         "Parametric circle": "Plot parametric x(t)=cos(t), y(t)=sin(t)",
         "Polar cardioid": "Plot polar r = 1 + cos(t)",
-        "3D paraboloid": "Plot 3D surface z = x^2 + y^2"
+        "3D paraboloid": "Plot 3D surface z = x^2 + y^2",
+        "Animated 3D paraboloid": "Animate 3D surface z = sin(sqrt(x^2+y^2))",
+        "Animated 3D sphere": (
+            "Animate 3D parametric "
+            "x(u,v)=sin(u)*cos(v) "
+            "y(u,v)=sin(u)*sin(v) "
+            "z(u,v)=cos(u)"
+        )
     }
     st.session_state["question"] = examples[example]
     st.rerun()
@@ -276,6 +502,11 @@ if st.button("🚀 SOLVE & GRAPH", type="primary"):
         f"Detected graph type: **{graph_type}**"
         + (f"  |  Equations found: `{len(equations)}`" if equations else "")
     )
+
+    if equations:
+        with st.expander("🔎 Parsed input"):
+            for eq in equations:
+                st.code(clean_math(eq), language="text")
 
     # Special curves
     if graph_type in ["Butterfly", "Heart"]:
@@ -410,12 +641,20 @@ if st.button("🚀 SOLVE & GRAPH", type="primary"):
             ey = None
 
             for eq in equations:
-                m = re.match(r"\s*x\s*\(\s*t\s*\)\s*=\s*(.*)", clean_math(eq), re.I)
+                s_eq = clean_math(eq)
+
+                m = re.match(r"\s*x\s*\(\s*t\s*\)\s*=\s*(.*)", s_eq, re.I)
                 if m:
                     ex = parse_expr(m.group(1))
-                m = re.match(r"\s*y\s*\(\s*t\s*\)\s*=\s*(.*)", clean_math(eq), re.I)
+                    continue
+
+                m = re.match(r"\s*y\s*\(\s*t\s*\)\s*=\s*(.*)", s_eq, re.I)
                 if m:
                     ey = parse_expr(m.group(1))
+                    continue
+
+                # Also support x(t)=... / y(t)=... without requiring
+                # exact spacing or with uppercase letters.
 
             # Also accept x=..., y=... if user selected parametric.
             if ex is None:
@@ -434,116 +673,4 @@ if st.button("🚀 SOLVE & GRAPH", type="primary"):
             fx = sp.lambdify(t, ex, "numpy")
             fy = sp.lambdify(t, ey, "numpy")
 
-            fig, ax = plt.subplots(figsize=(9, 7))
-            ax.plot(fx(T), fy(T))
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            ax.set_title("2D Parametric Graph")
-            ax.grid(grid)
-            if show_axes:
-                ax.axhline(0, linewidth=0.8)
-                ax.axvline(0, linewidth=0.8)
-            ax.set_aspect("equal", adjustable="box")
-            st.pyplot(fig)
-            plt.close(fig)
-
-        except Exception as e:
-            st.error(f"Parametric error: {e}")
-
-    # -----------------------------------------------------
-    # Polar
-    # -----------------------------------------------------
-    elif graph_type == "Polar":
-        fig, ax = plt.subplots(figsize=(9, 7), subplot_kw={"projection": "polar"})
-
-        plotted = 0
-        T = np.linspace(0, 2 * np.pi, resolution)
-
-        for eq in equations:
-            try:
-                s = clean_math(eq)
-                if "=" in s:
-                    left, right = s.split("=", 1)
-                    if left.strip().lower() != "r":
-                        raise ValueError("Polar equation must use r = ...")
-                    expr = parse_expr(right)
-                else:
-                    expr = parse_expr(s)
-
-                fn = sp.lambdify(t, expr, "numpy")
-                R = fn(T)
-                ax.plot(T, R, label=eq)
-                plotted += 1
-
-            except Exception as e:
-                st.warning(f"Could not plot `{eq}`: {e}")
-
-        if plotted == 0:
-            st.error("No valid polar equation.")
-            st.stop()
-
-        ax.set_title("Polar Graph")
-        if plotted > 1:
-            ax.legend()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    # -----------------------------------------------------
-    # 3D Surface
-    # -----------------------------------------------------
-    elif graph_type == "3D Surface":
-        expr_text = None
-
-        # Prefer z=...
-        for eq in equations:
-            if re.match(r"\s*z\s*=", clean_math(eq), re.I):
-                expr_text = clean_math(eq).split("=", 1)[1]
-                break
-
-        if expr_text is None:
-            # If user entered only an expression, use it as z=f(x,y)
-            expr_text = equations[0]
-
-        try:
-            expr = parse_expr(expr_text)
-            fn = sp.lambdify((x, y), expr, "numpy")
-
-            n3 = min(resolution, 500)
-            X = np.linspace(xmin, xmax, n3)
-            Y = np.linspace(ymin, ymax, n3)
-            XX, YY = np.meshgrid(X, Y)
-            ZZ = np.asarray(fn(XX, YY), dtype=float)
-
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection="3d")
-            ax.plot_surface(XX, YY, ZZ, linewidth=0, antialiased=True)
-
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            ax.set_zlabel("z")
-            ax.set_title("3D Surface")
-            st.pyplot(fig)
-            plt.close(fig)
-
-        except Exception as e:
-            st.error(f"3D surface error: {e}")
-
-    else:
-        st.error("Choose a graph type or keep Auto mode.")
-
-
-st.divider()
-st.markdown(
-    """
-### 📚 Supported
-
-**2D:** functions, lines, parabolas, circles, implicit curves, multiple equations  
-**Parametric:** `x(t), y(t)`  
-**Polar:** `r = f(t)`  
-**3D:** `z = f(x,y)` surfaces  
-**Special:** ❤️ Heart and 🦋 Butterfly curves
-
-> Tip: For the most reliable result, put each equation on its own line.
-"""
-    )
-            
+            fig, ax = plt.subplots(fig
